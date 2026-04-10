@@ -1147,6 +1147,8 @@ async function handleStepData(step, payload) {
 // Map of step -> { resolve, reject } for waiting on step completion
 const stepWaiters = new Map();
 let resumeWaiter = null;
+const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
+const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 7, 8]);
 
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
@@ -1281,9 +1283,35 @@ async function executeStep(step) {
  */
 async function executeStepAndWait(step, delayAfter = 2000) {
   throwIfStopped();
-  const promise = waitForStepComplete(step, 120000);
-  await executeStep(step);
-  await promise;
+
+  if (AUTO_RUN_BACKGROUND_COMPLETED_STEPS.has(step)) {
+    await addLog(`自动运行：步骤 ${step} 由后台流程负责收尾，执行函数返回后将直接进入下一步。`, 'info');
+    await executeStep(step);
+    const latestState = await getState();
+    await addLog(`自动运行：步骤 ${step} 已执行返回，当前状态为 ${latestState.stepStatuses?.[step] || 'pending'}，准备继续后续步骤。`, 'info');
+  } else {
+    await addLog(`自动运行：步骤 ${step} 已发起，正在等待完成信号（超时 ${AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS / 1000} 秒）。`, 'info');
+    const completionResultPromise = waitForStepComplete(step, AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS).then(
+      payload => ({ ok: true, payload }),
+      error => ({ ok: false, error }),
+    );
+
+    try {
+      await executeStep(step);
+    } catch (err) {
+      notifyStepError(step, getErrorMessage(err));
+      await completionResultPromise;
+      throw err;
+    }
+
+    const completionResult = await completionResultPromise;
+    if (!completionResult.ok) {
+      throw completionResult.error;
+    }
+
+    await addLog(`自动运行：步骤 ${step} 已收到完成信号，准备继续后续步骤。`, 'info');
+  }
+
   // Extra delay for page transitions / DOM updates
   if (delayAfter > 0) {
     await sleepWithStop(delayAfter + Math.floor(Math.random() * 1200));
