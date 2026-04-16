@@ -4,6 +4,7 @@
   function createMessageRouter(deps = {}) {
     const {
       addLog,
+      appendAccountRunRecord,
       batchUpdateLuckmailPurchases,
       buildLocalhostCleanupPrefix,
       buildLuckmailSessionSettingsPayload,
@@ -77,6 +78,19 @@
       upsertHotmailAccount,
       verifyHotmailAccount,
     } = deps;
+
+    async function appendManualAccountRunRecordIfNeeded(status, stateOverride = null, reason = '') {
+      if (typeof appendAccountRunRecord !== 'function') {
+        return null;
+      }
+
+      const state = stateOverride || await getState();
+      if (isAutoRunLockedState(state)) {
+        return null;
+      }
+
+      return appendAccountRunRecord(status, state, reason);
+    }
 
     async function handleStepData(step, payload) {
       switch (step) {
@@ -187,12 +201,17 @@
         case 'STEP_COMPLETE': {
           if (getStopRequested()) {
             await setStepStatus(message.step, 'stopped');
+            await appendManualAccountRunRecordIfNeeded(`step${message.step}_stopped`, null, '流程已被用户停止。');
             notifyStepError(message.step, '流程已被用户停止。');
             return { ok: true };
           }
+          const completionState = message.step === 9 ? await getState() : null;
           await setStepStatus(message.step, 'completed');
           await addLog(`步骤 ${message.step} 已完成`, 'ok');
           await handleStepData(message.step, message.payload);
+          if (message.step === 9 && typeof appendAccountRunRecord === 'function') {
+            await appendAccountRunRecord('success', completionState);
+          }
           notifyStepComplete(message.step, message.payload);
           return { ok: true };
         }
@@ -201,10 +220,12 @@
           if (isStopError(message.error)) {
             await setStepStatus(message.step, 'stopped');
             await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
+            await appendManualAccountRunRecordIfNeeded(`step${message.step}_stopped`, null, message.error);
             notifyStepError(message.step, message.error);
           } else {
             await setStepStatus(message.step, 'failed');
             await addLog(`步骤 ${message.step} 失败：${message.error}`, 'error');
+            await appendManualAccountRunRecordIfNeeded(`step${message.step}_failed`, null, message.error);
             notifyStepError(message.step, message.error);
           }
           return { ok: true };

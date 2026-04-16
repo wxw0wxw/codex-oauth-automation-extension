@@ -1,6 +1,7 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
 importScripts(
+  'background/account-run-history.js',
   'background/panel-bridge.js',
   'background/generated-email-helpers.js',
   'background/signup-flow-helpers.js',
@@ -123,6 +124,7 @@ const HOTMAIL_MAILBOXES = ['INBOX', 'Junk'];
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
+const STEP6_MAX_ATTEMPTS = 3;
 const STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS = 8;
 const SUB2API_STEP1_RESPONSE_TIMEOUT_MS = 90000;
 const SUB2API_STEP9_RESPONSE_TIMEOUT_MS = 120000;
@@ -154,6 +156,7 @@ const DEFAULT_LUCKMAIL_PROJECT_CODE = 'openai';
 const DISPLAY_TIMEZONE = 'Asia/Shanghai';
 const MICROSOFT_TOKEN_DNR_RULE_ID = 1001;
 const PERSISTENT_ALIAS_STATE_KEYS = ['manualAliasUsage', 'preservedAliases'];
+const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 
 initializeSessionStorageAccess();
 setupDeclarativeNetRequestRules();
@@ -4400,14 +4403,32 @@ function notifyStepError(step, error) {
 async function completeStepFromBackground(step, payload = {}) {
   if (stopRequested) {
     await setStepStatus(step, 'stopped');
+    await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, null, STOP_ERROR_MESSAGE);
     notifyStepError(step, STOP_ERROR_MESSAGE);
     return;
   }
 
+  const completionState = step === 9 ? await getState() : null;
   await setStepStatus(step, 'completed');
   await addLog(`步骤 ${step} 已完成`, 'ok');
   await handleStepData(step, payload);
+  if (step === 9 && accountRunHistoryHelpers?.appendAccountRunRecord) {
+    await accountRunHistoryHelpers.appendAccountRunRecord('success', completionState);
+  }
   notifyStepComplete(step, payload);
+}
+
+async function appendManualAccountRunRecordIfNeeded(status, stateOverride = null, reason = '') {
+  if (!accountRunHistoryHelpers?.appendAccountRunRecord) {
+    return null;
+  }
+
+  const state = stateOverride || await getState();
+  if (isAutoRunLockedState(state)) {
+    return null;
+  }
+
+  return accountRunHistoryHelpers.appendAccountRunRecord(status, state, reason);
 }
 
 async function finalizeDeferredStepExecutionError(step, error) {
@@ -4420,11 +4441,13 @@ async function finalizeDeferredStepExecutionError(step, error) {
   if (isStopError(error)) {
     await setStepStatus(step, 'stopped');
     await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+    await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, latestState, getErrorMessage(error));
     return;
   }
 
   await setStepStatus(step, 'failed');
   await addLog(`步骤 ${step} 失败：${getErrorMessage(error)}`, 'error');
+  await appendManualAccountRunRecordIfNeeded(`step${step}_failed`, latestState, getErrorMessage(error));
 }
 
 async function executeStepViaCompletionSignal(step, timeoutMs = AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS) {
@@ -4592,11 +4615,13 @@ async function executeStep(step, options = {}) {
     if (isStopError(err)) {
       await setStepStatus(step, 'stopped');
       await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+      await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, state, getErrorMessage(err));
       throw err;
     }
     if (!(deferRetryableTransportError && doesStepUseCompletionSignal(step) && isRetryableContentScriptTransportError(err))) {
       await setStepStatus(step, 'failed');
       await addLog(`步骤 ${step} 失败：${err.message}`, 'error');
+      await appendManualAccountRunRecordIfNeeded(`step${step}_failed`, state, getErrorMessage(err));
     } else {
       console.warn(
         LOG_PREFIX,
@@ -4713,6 +4738,8 @@ let autoRunAttemptRun = 0;
 const EMAIL_FETCH_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS = 25000;
+const MAIL_2925_VERIFICATION_MAX_ATTEMPTS = 15;
+const MAIL_2925_VERIFICATION_INTERVAL_MS = 15000;
 const AUTO_STEP_DELAYS = {
   1: 2000,
   2: 2000,
@@ -4724,8 +4751,19 @@ const AUTO_STEP_DELAYS = {
   8: 2000,
   9: 1000,
 };
+const accountRunHistoryHelpers = self.MultiPageBackgroundAccountRunHistory?.createAccountRunHistoryHelpers({
+  ACCOUNT_RUN_HISTORY_STORAGE_KEY,
+  addLog,
+  buildHotmailLocalEndpoint,
+  chrome,
+  getErrorMessage,
+  getState,
+  HOTMAIL_SERVICE_MODE_LOCAL,
+  normalizeHotmailLocalBaseUrl,
+});
 const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoRunController({
   addLog,
+  appendAccountRunRecord: (...args) => accountRunHistoryHelpers?.appendAccountRunRecord?.(...args),
   AUTO_RUN_MAX_RETRIES_PER_ROUND,
   AUTO_RUN_RETRY_DELAY_MS,
   AUTO_RUN_TIMER_KIND_BEFORE_RETRY,
@@ -5117,6 +5155,8 @@ const verificationFlowHelpers = self.MultiPageBackgroundVerificationFlow?.create
   HOTMAIL_PROVIDER,
   isStopError,
   LUCKMAIL_PROVIDER,
+  MAIL_2925_VERIFICATION_INTERVAL_MS,
+  MAIL_2925_VERIFICATION_MAX_ATTEMPTS,
   pollCloudflareTempEmailVerificationCode,
   pollHotmailVerificationCode,
   pollLuckmailVerificationCode,
@@ -5190,6 +5230,7 @@ const step5Executor = self.MultiPageBackgroundStep5?.createStep5Executor({
 const step6Executor = self.MultiPageBackgroundStep6?.createStep6Executor({
   addLog,
   completeStepFromBackground,
+  getErrorMessage,
   getLoginAuthStateLabel,
   getState,
   isStep6RecoverableResult,
@@ -5200,6 +5241,7 @@ const step6Executor = self.MultiPageBackgroundStep6?.createStep6Executor({
   sendToContentScriptResilient,
   shouldSkipLoginVerificationForCpaCallback,
   skipLoginVerificationStepsForCpaCallback,
+  STEP6_MAX_ATTEMPTS,
   throwIfStopped,
 });
 const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
@@ -5209,6 +5251,7 @@ const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
   confirmCustomVerificationStepBypass: verificationFlowHelpers.confirmCustomVerificationStepBypass,
   ensureStep7VerificationPageReady,
   executeStep6: (...args) => executeStep6(...args),
+  getPanelMode,
   getMailConfig,
   getState,
   getTabId,
@@ -5259,6 +5302,7 @@ const stepExecutorsByKey = {
 };
 const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter({
   addLog,
+  appendAccountRunRecord: (...args) => accountRunHistoryHelpers?.appendAccountRunRecord?.(...args),
   batchUpdateLuckmailPurchases,
   buildLocalhostCleanupPrefix,
   buildLuckmailSessionSettingsPayload,
@@ -5801,8 +5845,8 @@ async function skipLoginVerificationStepsForCpaCallback() {
   }
 }
 
-async function executeStep6(state) {
-  return step6Executor.executeStep6(state);
+async function executeStep6(state, options = {}) {
+  return step6Executor.executeStep6(state, options);
 }
 
 // ============================================================

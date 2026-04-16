@@ -15,6 +15,8 @@
       HOTMAIL_PROVIDER,
       isStopError,
       LUCKMAIL_PROVIDER,
+      MAIL_2925_VERIFICATION_INTERVAL_MS,
+      MAIL_2925_VERIFICATION_MAX_ATTEMPTS,
       pollCloudflareTempEmailVerificationCode,
       pollHotmailVerificationCode,
       pollLuckmailVerificationCode,
@@ -62,14 +64,15 @@
     }
 
     function getVerificationPollPayload(step, state, overrides = {}) {
+      const is2925Provider = state?.mailProvider === '2925';
       if (step === 4) {
         return {
           filterAfterTimestamp: getHotmailVerificationRequestTimestamp(4, state),
           senderFilters: ['openai', 'noreply', 'verify', 'auth', 'duckduckgo', 'forward'],
           subjectFilters: ['verify', 'verification', 'code', '验证码', 'confirm'],
           targetEmail: state.email,
-          maxAttempts: 5,
-          intervalMs: 3000,
+          maxAttempts: is2925Provider ? MAIL_2925_VERIFICATION_MAX_ATTEMPTS : 5,
+          intervalMs: is2925Provider ? MAIL_2925_VERIFICATION_INTERVAL_MS : 3000,
           ...overrides,
         };
       }
@@ -79,8 +82,8 @@
         senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt', 'duckduckgo', 'forward'],
         subjectFilters: ['verify', 'verification', 'code', '验证码', 'confirm', 'login'],
         targetEmail: state.email,
-        maxAttempts: 5,
-        intervalMs: 3000,
+        maxAttempts: is2925Provider ? MAIL_2925_VERIFICATION_MAX_ATTEMPTS : 5,
+        intervalMs: is2925Provider ? MAIL_2925_VERIFICATION_INTERVAL_MS : 3000,
         ...overrides,
       };
     }
@@ -368,6 +371,9 @@
       const hotmailPollConfig = mail.provider === HOTMAIL_PROVIDER
         ? getHotmailVerificationPollConfig(step)
         : null;
+      const beforeSubmit = typeof options.beforeSubmit === 'function'
+        ? options.beforeSubmit
+        : null;
       const ignorePersistedLastCode = Boolean(hotmailPollConfig?.ignorePersistedLastCode);
       if (state[stateKey] && !ignorePersistedLastCode) {
         rejectedCodes.add(state[stateKey]);
@@ -431,6 +437,14 @@
 
         throwIfStopped();
         await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
+        if (beforeSubmit) {
+          await beforeSubmit(result, {
+            attempt,
+            rejectedCodes: new Set(rejectedCodes),
+            filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
+            lastResendAt,
+          });
+        }
         throwIfStopped();
         const submitResult = await submitVerificationCode(step, result.code);
 

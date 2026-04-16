@@ -4,6 +4,7 @@
   function createAutoRunController(deps = {}) {
     const {
       addLog,
+      appendAccountRunRecord,
       AUTO_RUN_MAX_RETRIES_PER_ROUND,
       AUTO_RUN_RETRY_DELAY_MS,
       AUTO_RUN_TIMER_KIND_BEFORE_RETRY,
@@ -303,6 +304,7 @@
 
       for (let targetRun = resumeCurrentRun; targetRun <= totalRuns; targetRun += 1) {
         const roundSummary = roundSummaries[targetRun - 1];
+        let roundRecordAppended = false;
         const resumingCurrentRound = continueCurrentOnFirstAttempt && targetRun === resumeCurrentRun;
         let attemptRun = resumingCurrentRound ? resumeAttemptRun : 1;
         let reuseExistingProgress = resumingCurrentRound;
@@ -377,6 +379,21 @@
             forceFreshTabsNextRun = false;
           }
 
+          const appendRoundRecordIfNeeded = async (status, reason = '') => {
+            if (roundRecordAppended) {
+              return;
+            }
+
+            if (typeof appendAccountRunRecord !== 'function') {
+              return;
+            }
+
+            const record = await appendAccountRunRecord(status, null, reason);
+            if (record) {
+              roundRecordAppended = true;
+            }
+          };
+
           try {
             deps.throwIfStopped();
             await broadcastAutoRunStatus('running', {
@@ -403,6 +420,7 @@
           } catch (err) {
             if (isStopError(err)) {
               stoppedEarly = true;
+              await appendRoundRecordIfNeeded('stopped', getErrorMessage(err));
               await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
               await broadcastAutoRunStatus('stopped', {
                 currentRun: targetRun,
@@ -444,6 +462,7 @@
               } catch (sleepError) {
                 if (isStopError(sleepError)) {
                   stoppedEarly = true;
+                  await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError));
                   await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
                   await broadcastAutoRunStatus('stopped', {
                     currentRun: targetRun,
@@ -466,6 +485,7 @@
               } catch (sleepError) {
                 if (isStopError(sleepError)) {
                   stoppedEarly = true;
+                  await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError));
                   await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
                   await broadcastAutoRunStatus('stopped', {
                     currentRun: targetRun,
@@ -486,6 +506,7 @@
             await setState({
               autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
             });
+            await appendRoundRecordIfNeeded('failed', reason);
             if (!autoRunSkipFailures) {
               cancelPendingCommands('当前轮执行失败。');
               await broadcastStopToContentScripts();
